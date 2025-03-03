@@ -1,0 +1,160 @@
+---
+title: "Week 06 - Genetic Algorithm Assignment"
+author: "Nandini"
+date: "2025-03-02"
+output: html_document
+---
+
+```{r}
+library(data.table)
+library(geosphere)
+library(GA)
+library(purrr)
+library(sf)
+
+## Load the population data
+pop.data <- data.table::fread("Mo_pop_Sim.csv")
+str(pop.data)
+frac <- 0.0001
+small.data <- pop.data[sample(1:nrow(pop.data),
+                               size = round(nrow(pop.data) * frac),
+                               replace = F), ## extract a sample of randomlychosen 1% rows
+                        ]  ## and choose all columns
+
+## Load the FQHC data
+data_path <- 'MO_2018_Federally_Qualified_Health_Center_Locations'
+fqhc.data <- data.table(as.data.frame(st_read(data_path,
+                     'MO_2018_Federally_Qualified_Health_Center_Locations')))
+
+names(fqhc.data)
+```
+
+
+One approach can be to use the average closeness of a location from all of the residences - those locations that are the closest to all of the residences, on average, are the ones that are more easily accessible, and therefore would/should be selected. What is the assumption that is implicit here?
+
+Approach 1: Average Closeness to All Residences
+```{r}
+fqhc_coords <- fqhc.data[, .(Longitude, Latitude, Facility)]
+calc_avg_distance <- function(fqhc_lon, fqhc_lat, pop_data) {
+  pop_coords <- pop_data[, .(long, lat)]
+  distances <- distHaversine(
+    p1 = matrix(c(fqhc_lon, fqhc_lat), ncol = 2),
+    p2 = as.matrix(pop_coords)
+  )
+  mean(distances)
+}
+
+results_approach1 <- data.table(
+  Facility = fqhc.data$Facility,
+  Longitude = fqhc.data$Longitude,
+  Latitude = fqhc.data$Latitude,
+  Avg_Distance_km = 0
+)
+
+for (i in 1:nrow(results_approach1)) {
+  results_approach1[i, Avg_Distance_km := calc_avg_distance(
+    fqhc_lon = results_approach1[i, Longitude],
+    fqhc_lat = results_approach1[i, Latitude],
+    pop_data = small.data
+  )]
+}
+
+top_locations_approach1 <- results_approach1[order(Avg_Distance_km)][1:8]
+print(top_locations_approach1)
+```
+
+
+Another approach is to consider locations that have the highest densities of residences within a 30-mile radius (e.g., if location 1 has 59 residences and location 2 has 84 residences in a 30-mile radius, location 1 is to be considered "better" - why? because it can serve more people)
+
+Approach 2: Population Density within 30-Mile Radius
+```{r}
+radius_miles <- 30
+
+radius_km <- radius_miles * 1.60934
+
+count_within_radius <- function(fqhc_lon, fqhc_lat, pop_data, radius_km) {
+  pop_coords <- pop_data[, .(long, lat)]
+
+  distances <- distHaversine(
+    p1 = matrix(c(fqhc_lon, fqhc_lat), ncol = 2),
+    p2 = as.matrix(pop_coords)
+  )
+  sum(distances <= radius_km)
+}
+
+results_approach2 <- data.table(
+  Facility = fqhc.data$Facility,
+  Longitude = fqhc.data$Longitude,
+  Latitude = fqhc.data$Latitude,
+  Population_Count = 0
+)
+
+for (i in 1:nrow(results_approach2)) {
+  results_approach2[i, Population_Count := count_within_radius(
+    fqhc_lon = results_approach2[i, Longitude],
+    fqhc_lat = results_approach2[i, Latitude],
+    pop_data = small.data,
+    radius_km = radius_km
+  )]
+}
+
+
+scaling_factor <- 1/frac  # 10000 if frac = 0.0001
+results_approach2[, Estimated_Population := Population_Count * scaling_factor]
+
+top_locations_approach2 <- results_approach2[order(-Estimated_Population)][1:8]
+print(top_locations_approach2)
+```
+
+```{r}
+## Define the fitness function
+fitness_function <- function(selected_indices) {
+  selected_fqhc <- fqhc.data[selected_indices, ]
+  total_population <- sum(sapply(1:nrow(selected_fqhc), function(i) {
+    count_within_radius(
+      fqhc_lon = selected_fqhc[i, Longitude],
+      fqhc_lat = selected_fqhc[i, Latitude],
+      pop_data = small.data,
+      radius_km = radius_km
+    )
+  }))
+  return(total_population)
+}
+
+## Run the Genetic Algorithm
+set.seed(123)
+ga_result <- ga(
+  type = "permutation",
+  fitness = function(x) fitness_function(x),
+  min = 1,
+  max = nrow(fqhc.data),
+  popSize = 50,
+  maxiter = 15,
+  run = 10,
+  pmutation = 0.2,
+  parallel = TRUE,
+  names = fqhc.data$Facility
+)
+
+## Extract the best solution
+best_solution <- ga_result@solution[1, ]
+best_fqhc <- fqhc.data[best_solution, ]
+
+## Display the best-selected facilities
+data.table::setDT(best_fqhc)
+print(best_fqhc)
+```
+
+
+
+
+
+The population density method would help me find FQHCs serving maximum residents positioned within 30 miles of each other. This operational method aligns perfectly with our mission to deliver specialized mental health assistance to the largest number of target recipients using minimal available locations (8 spots).
+The primary basis for allocation states services should operate at sites that reach big populations to maximize roi from each facility. The chosen locations with concentrated populations within thirty miles of our facilities enable us to serve more individuals seeking specialized service access. The approach presents essential value because mental health services need patients to receive continuous care through appointments that must be accessible by proximity.
+Several assumptions underlie this approach. This approach makes the initial assumption that mental health needs maintain uniform distribution throughout the entire population regardless of various demographic characteristics. The study adopts a 30-mile radius travel limit to estimate accessible mental health treatment facilities because it offers sufficient regional reach while people should be able to reach them easily for regular appointments. Our model assumes that current transportation facilities remain equal throughout all regions despite possible distinctions between city and country transportation networks.
+The fitness goal of this method involves counting all patients who live within thirty miles of each FQHC site. The maximum value of this metric exists within areas which provide service to the biggest number of patients. 
+We proceed by ranking FQHCs according to this fitness score where we select the eight locations that cover the maximum population. This single metric allows straightforward decisions which directly support service availability maximization because it provides actual objective results.
+The proposed approach brings better population density equity to medical service locations but it might neglect rural population access which opposes principles of equity. The implementation of this method could benefit from additional variables including the availability of current mental health services along with social vulnerability levels and commuting times besides mere geographical distance.
+
+
+
